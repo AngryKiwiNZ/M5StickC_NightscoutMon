@@ -4,6 +4,9 @@ A compact Nightscout display for the **M5StickC Plus v1.1**. This fork is
 configured as a passive bedside display: it shows glucose and time clearly
 without duplicating the phone's missing-data alerts.
 
+**Project status — 27 August 2026:** fully operational; no further changes are
+planned.
+
 ## Display behaviour
 
 - Alternates between the CGM screen and a large clock every 3 seconds.
