@@ -1,6 +1,9 @@
 # Prerequisites
 *.d
 
+# Personal Nightscout and Wi-Fi credentials. Keep this local-only.
+M5StickC_NSconfig.local.h
+
 # Object files
 *.o
 *.ko

@@ -21,8 +21,8 @@
 */
 
 // comment out one of the following lines according to your device
-#include <M5StickC.h>
-// #include <M5StickCPlus.h>
+#include <M5StickCPlus.h>
+// #include <M5StickC.h>
 // #include <M5StickCPlus2.h>
 
 #include <WiFi.h>
@@ -43,6 +43,20 @@
     #define LED_ON  LOW
     #define LED_OFF HIGH
 #endif
+
+// Bedside display settings. On the AXP192 used by M5StickC Plus,
+// ScreenBreath uses 0-15; 15 is the hardware maximum (100%).
+#define NIGHT_RED             0x8000
+#define NIGHT_ALARM_RED       TFT_RED
+#define SCREEN_ROTATE_MS      3000UL
+#define DAY_START_HOUR        8
+#define NIGHT_START_HOUR      21
+#define DAY_BRIGHTNESS        15
+#define NIGHT_BRIGHTNESS      7
+#define BRIGHTNESS_CHECK_MS   60000UL
+#define PIXEL_SHIFT_MS        60000UL
+#define NZ_TIMEZONE_RULE      "NZST-12NZDT,M9.5.0,M4.1.0/3"
+// The largest supported M5StickC-family display is 240 x 135.
 
 const int SPK_pin = 26;
 int spkChannel = 0;
@@ -65,6 +79,16 @@ unsigned long msCount;
 unsigned long msCountLog;
 unsigned long msCountAlert;
 static uint8_t lcdBrightness = 10;
+unsigned long lastScreenChange = 0;
+unsigned long lastBrightnessCheck = 0;
+unsigned long lastPixelShift = 0;
+bool showClock = false;
+bool cgmScreenValid = false;
+bool screenOff = false;
+bool manualBrightnessOverride = false;
+bool nightDisplayMode = false;
+int brightnessPeriod = -1;
+int screenShiftX = 0;
 
 DynamicJsonDocument JSONdoc(16384);
 float last10sgv[10];
@@ -73,7 +97,200 @@ int wasError = 0;
 time_t lastAlarmTime = 0;
 time_t lastSnoozeTime = 0;
 int led_alert = 0;
+bool dataWarningActive = false;
 char delta_display[32];
+char clockGlucoseSummary[32] = "CGM";
+char cachedGlucoseDisplay[16] = "--";
+char cachedAgeDisplay[16] = "NO DATA";
+int cachedArrowAngle = 180;
+bool cgmDataValid = false;
+
+void applyBacklight(uint8_t brightness) {
+#ifdef _M5_STICKC_PLUS2_H_
+  M5.Lcd.setBrightness(brightness * 15);
+#else
+  // Keep the original project's 0-15 configuration levels, but convert
+  // them to the M5StickC Plus AXP192 API's 0-100 range.
+  M5.Axp.ScreenBreath((uint16_t)brightness * 100 / 15);
+#endif
+}
+
+void setScreenBrightness(uint8_t brightness) {
+  lcdBrightness = brightness;
+  if (!screenOff) applyBacklight(brightness);
+}
+
+void configureLocalTime() {
+  setenv("TZ", NZ_TIMEZONE_RULE, 1);
+  tzset();
+  configTime(0, 0, ntpServer);
+}
+
+int currentBrightnessPeriod(int hour) {
+  if (hour >= DAY_START_HOUR && hour < NIGHT_START_HOUR) return 0;
+  return 1;  // Night period crosses midnight.
+}
+
+uint8_t brightnessForPeriod(int period) {
+  if (period == 0) return DAY_BRIGHTNESS;
+  return NIGHT_BRIGHTNESS;
+}
+
+bool isNightHour(int hour) {
+  return hour >= NIGHT_START_HOUR || hour < DAY_START_HOUR;
+}
+
+uint16_t normalTextColor() {
+  return nightDisplayMode ? NIGHT_RED : TFT_WHITE;
+}
+
+uint16_t mutedTextColor() {
+  return nightDisplayMode ? NIGHT_RED : TFT_LIGHTGREY;
+}
+
+void updateAutoBrightness() {
+  if (millis() - lastBrightnessCheck < BRIGHTNESS_CHECK_MS) return;
+  lastBrightnessCheck = millis();
+  if (!getLocalTime(&localTimeInfo)) return;
+
+  bool newNightDisplayMode = isNightHour(localTimeInfo.tm_hour);
+  if (nightDisplayMode != newNightDisplayMode) {
+    nightDisplayMode = newNightDisplayMode;
+    cgmScreenValid = false;
+    // Rebuild the cached CGM screen immediately with the new palette.
+    msCount = millis() - 15000;
+  }
+
+  int newPeriod = currentBrightnessPeriod(localTimeInfo.tm_hour);
+  if (brightnessPeriod == newPeriod) return;
+
+  // A button-selected value is retained throughout its current time period.
+  brightnessPeriod = newPeriod;
+  if (manualBrightnessOverride) {
+    Serial.println("Manual brightness override ended");
+  }
+  manualBrightnessOverride = false;
+  setScreenBrightness(brightnessForPeriod(newPeriod));
+}
+
+bool glucoseAlarmActive() {
+  // Only genuine glucose threshold alarms hold the CGM view. Missing/stale,
+  // unreachable, or temporarily unavailable data remains display-only.
+  return led_alert != 0;
+}
+
+void drawDataWarning(const char *message) {
+  cgmDataValid = false;
+  M5.Lcd.setTextColor(nightDisplayMode ? NIGHT_RED : TFT_RED, TFT_BLACK);
+  M5.Lcd.drawString(message, 0, 0, 2);
+}
+
+void drawArrow(int x, int y, int asize, int aangle, int pwidth, int plength, uint16_t color);
+void drawStatusLine();
+
+void cacheCGMScreen() {
+  // M5StickC's LCD does not reliably support framebuffer readback.  Cache
+  // display values instead of reading pixels back from the controller.
+  cgmScreenValid = true;
+}
+
+void drawCGMScreen() {
+  M5.Lcd.fillScreen(BLACK);
+  M5.Lcd.setTextSize(1);
+  M5.Lcd.setTextColor(normalTextColor(), BLACK);
+  if (!cgmDataValid || dataWarningActive || wasError) {
+    if (dataWarningActive && cgmDataValid && !wasError) {
+      M5.Lcd.drawCentreString("STALE", M5.Lcd.width() / 2 + screenShiftX,
+                              M5.Lcd.height() / 2 - 16, 2);
+      M5.Lcd.drawCentreString(cachedAgeDisplay, M5.Lcd.width() / 2 + screenShiftX,
+                              M5.Lcd.height() / 2, 2);
+    } else {
+      M5.Lcd.drawCentreString(wasError ? "NO DATA" : "Waiting for glucose",
+                              M5.Lcd.width() / 2 + screenShiftX,
+                              M5.Lcd.height() / 2 - 8, 2);
+    }
+    drawStatusLine();
+    return;
+  }
+
+  M5.Lcd.drawString(cachedAgeDisplay, 4 + screenShiftX, 0, 2);
+  M5.Lcd.drawString(delta_display, M5.Lcd.width() - 48 + screenShiftX, 0, 2);
+  M5.Lcd.drawString(cachedGlucoseDisplay, 4 + screenShiftX, 19, 4);
+  if (cachedArrowAngle != 180) {
+    drawArrow(M5.Lcd.width() - 38 + screenShiftX, M5.Lcd.height() / 2 + 2,
+              10, cachedArrowAngle + 85, 30, 30, normalTextColor());
+  }
+  drawStatusLine();
+}
+
+void drawClockScreen() {
+  char clockString[6] = "??:??";
+  if (getLocalTime(&localTimeInfo)) {
+    snprintf(clockString, sizeof(clockString), "%02d:%02d",
+             localTimeInfo.tm_hour, localTimeInfo.tm_min);
+  }
+  M5.Lcd.fillScreen(BLACK);
+  M5.Lcd.setTextSize(1);
+  M5.Lcd.setTextColor(normalTextColor(), BLACK);
+  int font = 7;
+  int x = (M5.Lcd.width() - M5.Lcd.textWidth(clockString, font)) / 2 + screenShiftX;
+  int y = (M5.Lcd.height() - M5.Lcd.fontHeight(font)) / 2;
+  M5.Lcd.drawString(clockString, x, y, font);
+  int summaryX = (M5.Lcd.width() - M5.Lcd.textWidth(clockGlucoseSummary, 2)) / 2 + screenShiftX;
+  M5.Lcd.drawString(clockGlucoseSummary, summaryX, M5.Lcd.height() - 18, 2);
+}
+
+void drawStatusLine() {
+  int y = M5.Lcd.height() - 10;
+  M5.Lcd.fillRect(0, y, M5.Lcd.width(), 10, TFT_BLACK);
+  M5.Lcd.setTextColor(mutedTextColor(), TFT_BLACK);
+  if (dataWarningActive || wasError) {
+    M5.Lcd.drawString("NO DATA", 0, y, 1);
+  } else if (WiFiMulti.run() == WL_CONNECTED) {
+    M5.Lcd.drawString("WiFi OK", 0, y, 1);
+  } else {
+    M5.Lcd.drawString("WiFi LOST", 0, y, 1);
+  }
+}
+
+void updatePixelShift() {
+  if (millis() - lastPixelShift < PIXEL_SHIFT_MS) return;
+  lastPixelShift = millis();
+  screenShiftX = screenShiftX == 0 ? 1 : 0;
+  if (!screenOff) {
+    if (showClock) drawClockScreen();
+    else drawCGMScreen();
+  }
+}
+
+void updateDisplayMode() {
+  if (screenOff) {
+    if (led_alert != 0) {
+      screenOff = false;
+      applyBacklight(lcdBrightness);
+      drawCGMScreen();
+    }
+    return;
+  }
+  if (glucoseAlarmActive()) {
+    if (showClock) {
+      showClock = false;
+      drawCGMScreen();
+    }
+    return;
+  }
+  if (millis() - lastScreenChange >= SCREEN_ROTATE_MS) {
+    lastScreenChange = millis();
+    showClock = !showClock;
+    if (showClock) {
+      Serial.println("DISPLAY VIEW: CLOCK");
+      drawClockScreen();
+    } else {
+      Serial.println("DISPLAY VIEW: CGM");
+      drawCGMScreen();
+    }
+  }
+}
 
 void startupLogo() {
     // static uint8_t brightness, pre_brightness;
@@ -201,6 +418,14 @@ void sndWarning() {
 }
 
 void buttons_test() {
+  // Any button wakes the night-only screen-off mode without changing a setting.
+  if (screenOff && (digitalRead(M5_BUTTON_HOME) == LOW || digitalRead(M5_BUTTON_RST) == LOW)) {
+    screenOff = false;
+    applyBacklight(lcdBrightness);
+    drawCGMScreen();
+    while(digitalRead(M5_BUTTON_HOME) == LOW || digitalRead(M5_BUTTON_RST) == LOW);
+    return;
+  }
   if(digitalRead(M5_BUTTON_HOME) == LOW){
     // M5.Lcd.printf("A");
     Serial.printf("A");
@@ -215,14 +440,17 @@ void buttons_test() {
       else
         lcdBrightness = cfg.brightness1;
     Serial.print(" to "); Serial.println(lcdBrightness);
-#ifdef _M5_STICKC_PLUS2_H_
-    M5.Lcd.setBrightness(lcdBrightness*15);
-#else
-    M5.Axp.ScreenBreath(lcdBrightness);
-#endif
+    setScreenBrightness(lcdBrightness);
+    manualBrightnessOverride = true;
   while(digitalRead(M5_BUTTON_HOME) == LOW); // wait for release
   }
   if(digitalRead(M5_BUTTON_RST) == LOW) {
+    if (nightDisplayMode) {
+      screenOff = true;
+      applyBacklight(0);
+      while(digitalRead(M5_BUTTON_RST) == LOW);
+      return;
+    }
     digitalWrite(M5_LED, LED_ON);
     delay(500);
     digitalWrite(M5_LED, LED_OFF);
@@ -266,7 +494,7 @@ void wifi_connect() {
     Serial.println(WiFi.localIP());
     M5.Lcd.println(WiFi.localIP());
 
-    configTime(cfg.timeZone, cfg.dst, ntpServer);
+    configureLocalTime();
     delay(1000);
     printLocalTime();
 
@@ -276,6 +504,7 @@ void wifi_connect() {
 
 void setup() {
   M5.begin();
+  Serial.println("BUILD: M5StickC Plus bedside monitor | CGM + CLOCK only");
   pinMode(M5_BUTTON_HOME, INPUT);
   pinMode(M5_BUTTON_RST, INPUT);
   pinMode(M5_LED, OUTPUT);
@@ -299,7 +528,7 @@ void setup() {
   // Lcd display
   M5.Lcd.setRotation(cfg.display_rotation);
   M5.Lcd.fillScreen(BLACK);
-  M5.Lcd.setTextColor(WHITE);
+  M5.Lcd.setTextColor(normalTextColor());
   M5.Lcd.setCursor(0, 0, 1);
   M5.Lcd.setTextSize(1);
   yield();
@@ -330,20 +559,12 @@ void setup() {
   */
 
   lcdBrightness = cfg.brightness1;
-#ifdef _M5_STICKC_PLUS2_H_
-    M5.Lcd.setBrightness(lcdBrightness*15);
-#else
-    M5.Axp.ScreenBreath(lcdBrightness);
-#endif
+  setScreenBrightness(lcdBrightness);
   delay(cfg.power_on_wifi_delay*1000);
   wifi_connect();
   yield();
 
-#ifdef _M5_STICKC_PLUS2_H_
-    M5.Lcd.setBrightness(lcdBrightness*15);
-#else
-    M5.Axp.ScreenBreath(lcdBrightness);
-#endif
+  setScreenBrightness(lcdBrightness);
   M5.Lcd.fillScreen(TFT_BLACK);
 
   // test file with time stamps
@@ -354,6 +575,8 @@ void setup() {
 
   // update glycemia now
   msCount = millis()-16000;
+  lastScreenChange = millis();
+  lastBrightnessCheck = millis() - BRIGHTNESS_CHECK_MS;
 }
 
 void drawArrow(int x, int y, int asize, int aangle, int pwidth, int plength, uint16_t color){
@@ -382,7 +605,7 @@ void drawArrow(int x, int y, int asize, int aangle, int pwidth, int plength, uin
 }
 void update_glycemia() {
   M5.Lcd.setTextDatum(TL_DATUM);
-  M5.Lcd.setTextColor(WHITE, BLACK);
+  M5.Lcd.setTextColor(normalTextColor(), BLACK);
   M5.Lcd.setTextSize(1);
   M5.Lcd.setCursor(0, 0);
   // if there was an error, then clear whole screen, otherwise only graphic updated part
@@ -399,13 +622,11 @@ void update_glycemia() {
     digitalWrite(M5_LED, LED_ON);  
  
   M5.Lcd.setTextSize(1);
-  M5.Lcd.setTextColor(TFT_WHITE, TFT_BLACK);
+  M5.Lcd.setTextColor(normalTextColor(), TFT_BLACK);
   if(M5.Lcd.width()>160) { // PLUS version has bigger display
     M5.Lcd.fillRect(176, 25, 64, 89, TFT_BLACK);
-    M5.Lcd.drawBitmap(176, 26, 64, 48, (uint16_t *)WiFi_symbol);
   } else {
     M5.Lcd.fillRect(96, 16, 64, 54, TFT_BLACK);
-    M5.Lcd.drawBitmap(96, 16, 64, 48, (uint16_t *)WiFi_symbol);
   }
   // uint16_t maxWidth, uint16_t maxHeight, uint16_t offX, uint16_t offY, jpeg_div_t scale);
   if((WiFiMulti.run() == WL_CONNECTED)) {
@@ -479,9 +700,10 @@ void update_glycemia() {
         if (JSONerr) {   //Check for errors in parsing
           Serial.println("JSON parsing failed");
           Serial.print("DeserializationError = "); Serial.println(JSONerr.c_str());
-          M5.Lcd.drawString("JSON parsing failed", 0, 0, 2);
-          M5.Lcd.drawString(JSONerr.c_str(), 0, 16, 2);
+          drawDataWarning("NO DATA");
           wasError = 1;
+          dataWarningActive = true;
+          led_alert = 0;
         } else {
           char sensDev[64];
           uint64_t rawtime = 0;
@@ -545,7 +767,7 @@ void update_glycemia() {
             if(M5.Lcd.width()>160) { // PLUS version has bigger display
               M5.Lcd.fillRect(180, 0, 60, 24, TFT_BLACK);
               M5.Lcd.setTextSize(1);
-              M5.Lcd.setTextColor(TFT_WHITE, TFT_BLACK);
+              M5.Lcd.setTextColor(normalTextColor(), TFT_BLACK);
 #ifdef _M5_STICKC_PLUS2_H_
               M5.Lcd.drawRightString(delta_display, 237, 2, 4);
 #else
@@ -554,7 +776,7 @@ void update_glycemia() {
             } else {
               M5.Lcd.fillRect(80, 0, 64, 17, TFT_BLACK);
               M5.Lcd.setTextSize(1);
-              M5.Lcd.setTextColor(TFT_WHITE, TFT_BLACK);
+              M5.Lcd.setTextColor(normalTextColor(), TFT_BLACK);
               M5.Lcd.drawString(delta_display, 115, 0, 2);
             }
   
@@ -585,7 +807,7 @@ void update_glycemia() {
           Serial.print("Sensor time: "); Serial.print(sensTm.tm_hour); Serial.print(":"); Serial.print(sensTm.tm_min); Serial.print(":"); Serial.print(sensTm.tm_sec); Serial.print(" DST "); Serial.println(sensTm.tm_isdst);
 
           M5.Lcd.setTextSize(1);
-          M5.Lcd.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
+          M5.Lcd.setTextColor(mutedTextColor(), TFT_BLACK);
           // char dateStr[30];
           // sprintf(dateStr, "%d.%d.%04d", sensTm.tm_mday, sensTm.tm_mon+1, sensTm.tm_year+1900);
           // M5.Lcd.drawString(dateStr, 0, 48, GFXFF);
@@ -661,7 +883,7 @@ void update_glycemia() {
                 if(propJSONerr) {
                   Serial.println("Properties JSON parsing failed");
                   Serial.print("DeserializationError = "); Serial.println(JSONerr.c_str());
-                  M5.Lcd.setTextColor(TFT_YELLOW, TFT_BLACK);
+                  M5.Lcd.setTextColor(nightDisplayMode ? NIGHT_RED : TFT_YELLOW, TFT_BLACK);
                   M5.Lcd.setTextSize(1);
                   if(M5.Lcd.width()>160) { // PLUS version has bigger display
                     M5.Lcd.fillRect(0,25,69,23,TFT_BLACK);
@@ -693,7 +915,7 @@ void update_glycemia() {
                   if(M5.Lcd.width()>160) { // PLUS version has bigger display
                     M5.Lcd.fillRect(180, 0, 60, 24, TFT_BLACK);
                     M5.Lcd.setTextSize(1);
-                    M5.Lcd.setTextColor(TFT_WHITE, TFT_BLACK);
+                    M5.Lcd.setTextColor(normalTextColor(), TFT_BLACK);
 #ifdef _M5_STICKC_PLUS2_H_
                     M5.Lcd.drawRightString(delta_display, 237, 2, 4);
 #else
@@ -702,15 +924,15 @@ void update_glycemia() {
                   } else {
                     M5.Lcd.fillRect(80, 0, 64, 17, TFT_BLACK);
                     M5.Lcd.setTextSize(1);
-                    M5.Lcd.setTextColor(TFT_WHITE, TFT_BLACK);
+                    M5.Lcd.setTextColor(normalTextColor(), TFT_BLACK);
                     M5.Lcd.drawString(delta_display, 115, 0, 2);
                   }
         
                   if(cfg.show_COB_IOB) {
                     if(iob_iob>0)
-                      M5.Lcd.setTextColor(TFT_WHITE, TFT_BLACK);
+                      M5.Lcd.setTextColor(normalTextColor(), TFT_BLACK);
                     else
-                      M5.Lcd.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
+                      M5.Lcd.setTextColor(mutedTextColor(), TFT_BLACK);
                     if(M5.Lcd.width()>160) { // PLUS version has bigger display
                       M5.Lcd.fillRect(0,117,240,18,TFT_BLACK);
                       M5.Lcd.drawString(iob_displayLine, 0, 118, 2);
@@ -719,9 +941,9 @@ void update_glycemia() {
                       M5.Lcd.drawString(iob_displayLine, 0, 71, 1);
                     }
                     if(cob_cob>0)
-                      M5.Lcd.setTextColor(TFT_WHITE, TFT_BLACK);
+                      M5.Lcd.setTextColor(normalTextColor(), TFT_BLACK);
                     else
-                      M5.Lcd.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
+                      M5.Lcd.setTextColor(mutedTextColor(), TFT_BLACK);
                     if(M5.Lcd.width()>160) { // PLUS version has bigger display
                       M5.Lcd.drawString(cob_displayLine, 120, 118, 2);
                     } else {
@@ -743,25 +965,27 @@ void update_glycemia() {
           }
           Serial.print("Sensor time difference = "); Serial.print(sensorDifSec); Serial.println(" sec");
           unsigned int sensorDifMin = (sensorDifSec+30)/60;
-          uint16_t tdColor = TFT_DARKGREY;
-          if(sensorDifMin>5) {
-            tdColor = TFT_WHITE;
-            if(sensorDifMin>15) {
-              tdColor = TFT_RED;
-            }
-          }
+          // Keep stale-data detection for the LCD, but do not turn it into a
+          // hardware alarm.  Phone-side alerts handle missing CGM safety.
+          dataWarningActive = sensorDifMin >= cfg.snd_no_readings;
+          uint16_t tdColor = nightDisplayMode ? NIGHT_RED : TFT_DARKGREY;
+          if(sensorDifMin > 5) tdColor = nightDisplayMode ? NIGHT_RED : TFT_WHITE;
+          if(sensorDifMin > 15) tdColor = NIGHT_ALARM_RED;
 
           if(sensorDifMin>99) {
             strcpy(tmpstr, "Error");
           } else {
             sprintf(tmpstr, "%d min", sensorDifMin);
           }
+          strlcpy(cachedAgeDisplay, tmpstr, sizeof(cachedAgeDisplay));
           if(M5.Lcd.width()>160) { // PLUS version has bigger display
-            M5.Lcd.fillRoundRect(0, 0, 120, 25, 5, tdColor);
+            M5.Lcd.fillRoundRect(0, 0, 120, 25, 5,
+                                 nightDisplayMode ? TFT_BLACK : tdColor);
             M5.Lcd.setTextSize(1);
             // strcpy(tmpstr, "89 min");
             // M5.Lcd.setTextDatum(MC_DATUM);
-            M5.Lcd.setTextColor(TFT_BLACK, tdColor);
+            M5.Lcd.setTextColor(nightDisplayMode ? tdColor : TFT_BLACK,
+                                nightDisplayMode ? TFT_BLACK : tdColor);
 #ifdef _M5_STICKC_PLUS2_H_
             //M5.Lcd.drawString(tmpstr, 20, 2, 4);
             M5.Lcd.drawCentreString(tmpstr, 60, 2, 4);
@@ -769,19 +993,21 @@ void update_glycemia() {
             M5.Lcd.drawString(tmpstr, 60-M5.Lcd.textWidth(tmpstr, 4)/2, 1, 4);
 #endif
           } else {
-            M5.Lcd.fillRoundRect(16, 0, 64, 16, 5, tdColor);
+            M5.Lcd.fillRoundRect(16, 0, 64, 16, 5,
+                                 nightDisplayMode ? TFT_BLACK : tdColor);
             M5.Lcd.setTextSize(1);
             // M5.Lcd.setTextDatum(MC_DATUM);
-            M5.Lcd.setTextColor(TFT_BLACK, tdColor);
+            M5.Lcd.setTextColor(nightDisplayMode ? tdColor : TFT_BLACK,
+                                nightDisplayMode ? TFT_BLACK : tdColor);
             M5.Lcd.drawString(tmpstr, 26, 0, 2);
           }
           
-          uint16_t glColor = TFT_GREEN;
-          if(sensSgv<cfg.yellow_low || sensSgv>cfg.yellow_high) {
-            glColor=TFT_YELLOW; // warning is YELLOW
+          uint16_t glColor = nightDisplayMode ? NIGHT_RED : TFT_GREEN;
+          if(!nightDisplayMode && (sensSgv<cfg.yellow_low || sensSgv>cfg.yellow_high)) {
+            glColor=TFT_YELLOW;
           }
           if(sensSgv<cfg.red_low || sensSgv>cfg.red_high) {
-            glColor=TFT_RED; // alert is RED
+            glColor=NIGHT_ALARM_RED;
           }
 
           char glykStr[128];
@@ -800,6 +1026,10 @@ void update_glycemia() {
             if( sensSgvStr[0]!=' ' )
               smaller_font = 1;
           }
+          snprintf(clockGlucoseSummary, sizeof(clockGlucoseSummary), "%s  %s",
+                   sensSgvStr, delta_display);
+          strlcpy(cachedGlucoseDisplay, sensSgvStr, sizeof(cachedGlucoseDisplay));
+          cgmDataValid = true;
           if(M5.Lcd.width()>160) { // PLUS version has bigger display
             M5.Lcd.fillRect(0, 25, 240, 89, TFT_BLACK);
             // M5.Lcd.setTextDatum(TL_DATUM);
@@ -871,6 +1101,7 @@ void update_glycemia() {
               drawArrow(112, 40, 10, arrowAngle+85, 30, 30, glColor);
             }
           }
+          cachedArrowAngle = arrowAngle;
           
           /*
           // draw help lines
@@ -909,7 +1140,11 @@ void update_glycemia() {
           M5.Lcd.setTextSize(1);
           // M5.Lcd.setFreeFont(FSSB12);
           Serial.print("sensSgv="); Serial.print(sensSgv); Serial.print(", cfg.snd_alarm="); Serial.println(cfg.snd_alarm); 
-          if((sensSgv<=cfg.snd_alarm) && (sensSgv>=0.1)) {
+          if(dataWarningActive) {
+            // Never alert for an old glucose value, even if it was low/high.
+            Serial.println("STALE CGM DATA (display only)");
+            led_alert = 0;
+          } else if((sensSgv<=cfg.snd_alarm) && (sensSgv>=0.1)) {
             // red alarm state
             // M5.Lcd.fillRect(110, 220, 100, 20, TFT_RED);
             Serial.println("ALARM LOW");
@@ -966,20 +1201,12 @@ void update_glycemia() {
                   }
                 } else {
                   if( sensorDifMin>=cfg.snd_no_readings ) {
-                    // yellow warning state
-                    // M5.Lcd.fillRect(110, 220, 100, 20, TFT_YELLOW);
-                    Serial.println("WARNING NO READINGS");
-                    led_alert = 1;
-                    // M5.Lcd.fillRect(0, 220, 320, 20, TFT_YELLOW);
-                    // M5.Lcd.setTextColor(TFT_BLACK, TFT_YELLOW);
-                    // int stw=M5.Lcd.textWidth(tmpStr);
-                    // M5.Lcd.drawString(tmpStr, 159-stw/2, 220, 2);
-                    if( (alarmDifSec>cfg.alarm_repeat*60) && (snoozeDifSec==cfg.snooze_timeout*60) ) {
-                      sndWarning();
-                      lastAlarmTime = mktime(&timeinfo);
-                    }
+                    // Stale readings are display-only: no buzzer and no LED.
+                    Serial.println("STALE CGM DATA (display only)");
+                    led_alert = 0;
                   } else {
                     // normal glycemia state
+                    dataWarningActive = false;
                     led_alert = 0;
                     // M5.Lcd.fillRect(0, 220, 320, 20, TFT_BLACK);
                     // M5.Lcd.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
@@ -1008,22 +1235,34 @@ void update_glycemia() {
       } else {
         String errstr = String("[HTTP] GET not ok, error: " + String(httpCode));
         Serial.println(errstr);
-        M5.Lcd.setCursor(0, 23);
-        M5.Lcd.setTextSize(1);
-        M5.Lcd.println(errstr);
+        drawDataWarning("NO DATA");
         wasError = 1;
+        dataWarningActive = true;
+        led_alert = 0;
       }
     } else {
       String errstr = String("[HTTP] GET failed, error: " + String(http.errorToString(httpCode).c_str()));
       Serial.println(errstr);
-      M5.Lcd.setCursor(0, 23);
-      M5.Lcd.setTextSize(1);
-      M5.Lcd.println(errstr);
+      drawDataWarning("NO DATA");
       wasError = 1;
+      dataWarningActive = true;
+      led_alert = 0;
     }
   
     http.end();
+  } else {
+    Serial.println("WiFi unavailable - CGM display only warning");
+    drawDataWarning("NO DATA");
+    wasError = 1;
+    dataWarningActive = true;
+    led_alert = 0;
   }
+
+  // The network update still draws the original CGM layout.  Keep one copy so
+  // returning from the clock screen does not trigger another HTTP request.
+  drawStatusLine();
+  cacheCGMScreen();
+  if (showClock && !glucoseAlarmActive()) drawClockScreen();
 }
 
 // the loop routine runs over and over again forever
@@ -1039,7 +1278,7 @@ void loop(){
     if(cfg.show_current_time) {
       // update current time on display
       M5.Lcd.setTextSize(1);
-      M5.Lcd.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
+      M5.Lcd.setTextColor(mutedTextColor(), TFT_BLACK);
       if(!getLocalTime(&localTimeInfo)) {
         // unknown time
         strcpy(localTimeStr,"??:??:??");
@@ -1075,6 +1314,10 @@ void loop(){
       // ledcWriteTone(spkChannel, 0);
     }
   }
+
+  updateAutoBrightness();
+  updateDisplayMode();
+  updatePixelShift();
 
   yield();
 }

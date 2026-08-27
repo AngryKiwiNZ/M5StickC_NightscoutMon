@@ -1,5 +1,9 @@
 #include "M5StickC_NSconfig.h"
 
+#if __has_include("M5StickC_NSconfig.local.h")
+#include "M5StickC_NSconfig.local.h"
+#endif
+
 // here write YOUR NIGHTSCOUT configuration data (do not edit M5StickC_NSconfig.h file)
 
 void readConfiguration(tConfig *cfg) {
@@ -40,4 +44,7 @@ void readConfiguration(tConfig *cfg) {
   strlcpy(cfg->wlan2pass, "wlan2pass", 63);
   strlcpy(cfg->wlan3ssid, "wlan3ssid", 32);
   strlcpy(cfg->wlan3pass, "wlan3pass", 63);
+#ifdef M5STICKC_LOCAL_CONFIG
+  applyLocalConfiguration(cfg);
+#endif
 }

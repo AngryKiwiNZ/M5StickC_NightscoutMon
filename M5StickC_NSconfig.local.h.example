@@ -1,0 +1,14 @@
+#pragma once
+
+// Copy this file to M5StickC_NSconfig.local.h and add personal credentials.
+// The local file is ignored by Git and must never be committed.
+#define M5STICKC_LOCAL_CONFIG
+
+inline void applyLocalConfiguration(tConfig *cfg) {
+  strlcpy(cfg->url, "https://your-nightscout.example", sizeof(cfg->url));
+  strlcpy(cfg->token, "", sizeof(cfg->token));
+  strlcpy(cfg->wlan1ssid, "house-wifi-name", sizeof(cfg->wlan1ssid));
+  strlcpy(cfg->wlan1pass, "house-wifi-password", sizeof(cfg->wlan1pass));
+  strlcpy(cfg->wlan2ssid, "portable-hotspot-name", sizeof(cfg->wlan2ssid));
+  strlcpy(cfg->wlan2pass, "portable-hotspot-password", sizeof(cfg->wlan2pass));
+}

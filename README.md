@@ -10,6 +10,26 @@
 
 <img width="320" src="https://raw.githubusercontent.com/mlukasek/M5StickC_NightscoutMon/master/images/M5StickC_Nightscout_w-speaker.jpg">&nbsp;&nbsp;<img width="320" src="https://raw.githubusercontent.com/mlukasek/M5StickC_NightscoutMon/master/images/M5StickC_Nightscout_monitor_watch.jpg">
 
+### Bedside-display additions in this fork
+
+This fork is configured for the **M5StickC Plus v1.1** (`#include <M5StickCPlus.h>`).
+Install the M5StickC Plus Arduino library before compiling.
+
+- The screen alternates between the CGM view and a large clock every 3 seconds.
+- **Night mode** runs daily from **21:00 to 08:00** in New Zealand local time: dim red text on a black background.
+- **Day mode** runs from **08:00 to 21:00**: the normal colour palette and maximum display brightness.
+- The firmware uses the New Zealand timezone rule, including automatic daylight-saving transitions.
+- The blue Wi-Fi update animation is suppressed; Nightscout requests continue normally in the background.
+- Missing, stale, unreachable, or temporarily unavailable CGM data is a display-only condition (`NO DATA`/`STALE`). It does not beep or flash the LED. Low/high glucose alarms remain separate and unchanged.
+- The main button cycles the original brightness levels. A manual selection is retained until the next day/night transition.
+
+#### Private Nightscout and Wi-Fi configuration
+
+Do not put personal credentials in committed source files. Copy
+`M5StickC_NSconfig.local.h.example` to `M5StickC_NSconfig.local.h`, enter the
+Nightscout URL/token and Wi-Fi networks there, then compile normally. The local
+file is ignored by Git.
+
 ### Revisions:
 
 #### *** 31 January 2021 ***
